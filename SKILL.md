@@ -9,7 +9,23 @@ description: Use when you must prove something works FROM A CLEAN BASE — testi
 
 To prove something works **from nothing**, run it in a **disposable Docker container** that starts as the bare base you're claiming to support — then `docker exec` into it, **bash-piping** commands like you would any shell. Toss it when done.
 
-**Core principle:** a clean-room test is only honest if the host's tools *cannot leak in*. Your host has Python, node, uv, brew, a dozen dev tools on `$PATH`. Testing "does it install with no Python?" on the host — or in the native OS sandbox, which **runs on the host toolchain** — is testing a lie. You need a **fresh base whose contents you fully control**. A VM, chroot, or Nix/Guix shell also qualify; a throwaway container is just the cheapest such base that's *actually* Python-free.
+**Core principle:** a clean-room test is only honest if the host's tools *cannot leak in*. Your host has Python, node, uv, brew, a dozen dev tools on `$PATH`. Testing "does it install with no Python?" on the host — or in the native OS sandbox, which **runs on the host toolchain** — is testing a lie. You need a **fresh base whose _userland_ you control** (a container makes the userland clean — see the boundary below). A VM, chroot, or Nix/Guix shell also qualify; a throwaway container is just the cheapest such base that's *actually* Python-free.
+
+## What this proves — and what it does NOT
+
+Be precise about the claim, or "from nothing" overstates. A container proves your software behaves on a **chosen userland built from nothing** — packages, interpreters, `$PATH`, install scripts resolving with no host tools leaking in. That *is* the "does it install on a fresh base?" question, and it's real and worth proving.
+
+It does **not** prove whole-machine behaviour, because a container **shares the host kernel** and much of its environment:
+
+| Proven ✓ | NOT proven ✗ (differs from a real target) |
+|---|---|
+| userland packages / interpreters absent-then-installed | **host kernel · drivers · GPU · cgroups/seccomp** (same kernel as your host) |
+| `install.sh` / bootstrap resolving from a clean `$PATH` | **networking / DNS / proxy / firewall** (bridge net ≠ target LAN) |
+| lockfile / dependency set resolving from nothing | **boot / init / service-manager** (`sleep infinity` ≠ systemd; "starts on boot" untested) |
+| the tool self-fetching its runtime (uv/nvm/rustup) | **root vs normal user** — examples run as **root**, hiding `$HOME`/perm/sudo bugs (see caveats) |
+| | **reproducibility of the base** — unpinned tags + live `apt` mirrors drift (see caveats) |
+
+So: **userland-from-nothing ✓, whole-machine-from-nothing ✗.** State which you're claiming.
 
 ## When to use
 
@@ -56,17 +72,37 @@ docker exec "$BOX" bash -c 'command -v python3 || echo "python3 not on PATH ✓"
 docker exec "$BOX" bash -c 'cd /root && git clone <repo> && cd repo && git checkout <tag>'
 printf 'y\n' | docker exec -i "$BOX" bash -c 'cd /root/repo && ./install.sh'   # pipe "y" to a stdin prompt
 
+# 4b. ⚠️ The line above runs as ROOT in /root — that HIDES normal-user install bugs
+#     ($HOME assumptions, missing-sudo, perms, writes to privileged paths). A real
+#     laptop user is not root. If the install targets a normal user, test as one:
+docker exec "$BOX" bash -c 'useradd -m tester && apt-get install -y -qq sudo && echo "tester ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/tester'
+printf 'y\n' | docker exec -i -u tester "$BOX" bash -c 'cd ~ && git clone <repo> && cd repo && ./install.sh'  # run AS tester
+
 # 5. Observe from the host (published port), then TOSS it. Tossable is the point.
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:7777/
 docker rm -f "$BOX"
 ```
+
+## Try it (runnable)
+
+Don't take the recipe on faith — [`clean-room.sh`](./clean-room.sh) in this repo IS the recipe above, as a self-test. Run it with no args and it proves the flagship claim end-to-end, then tosses the box:
+
+```bash
+./clean-room.sh
+# → launches a Python-free debian:bookworm-slim, canaries the absence,
+#   watches uv self-bootstrap CPython 3.12 from nothing, prints PASS, tears down.
+```
+
+It self-disarms (`trap … EXIT` removes the box on Ctrl-C or any failure) and prints the arch it ran on. Verified green on arm64 / Apple Silicon.
 
 ## Caveats learned in the field
 
 - **Arch:** by default Docker resolves the image for your *host's* arch (aarch64 on Apple Silicon). Proving a mechanism on ARM ≠ proving it on a real x86 laptop — **say which arch you tested.** `--platform linux/amd64` forces x86 but needs QEMU/binfmt emulation (Docker Desktop bundles it): much slower, and it fails if emulation isn't available.
 - **libc:** `alpine` is musl, not glibc. Bootstrappers that fetch prebuilt glibc binaries (uv's CPython, many native wheels, node) can misbehave or fail on musl — a *second* confounding variable. For a faithful "normal laptop" clean-room prefer a glibc slim base (`debian:*-slim`, `ubuntu:*`) unless musl is what you're actually testing.
 - **Reachability / QR / phone:** a service reachable via `-p` must bind **`0.0.0.0`** inside the container — `-p` cannot forward to a service bound to `127.0.0.1` *inside* the box. Even then the app's own interface auto-detect may advertise the bridge IP (`172.x`/`10.x`), so a QR / "network URL" can point somewhere unreachable while the server is up. Verify from a *second device*; don't assume.
-- **Not a security boundary:** a plain container is isolation-for-tidiness, not a hostile-code jail — and **Docker daemon access is effectively host-root.** `--privileged`, host networking, host bind-mounts, or mounting `/var/run/docker.sock` make it strictly worse. Don't run untrusted code and call it safe.
+- **Root vs normal user:** `docker exec` lands you as **root** by default. A green install as root can still be broken for a real (non-root) user — `$HOME` assumptions, missing `sudo`, perms, writes to `/usr` that a user can't do. If the target is a normal-user machine, add a user and `docker exec -u <user>` (see step 4b). Root-only testing is a hidden confounder.
+- **The base is only "fully controlled" if you PIN it.** `debian:bookworm-slim` is a moving tag, and `apt-get update` pulls whatever the mirror serves *today* — so "reproducible from nothing" quietly drifts run-to-run. For a claim you'll cite later, pin the image by **digest** (`debian:bookworm-slim@sha256:…`) and, if it matters, snapshot/pin the apt suite. Otherwise state "unpinned, tested <date>".
+- **Not a security boundary:** a plain container is isolation-for-tidiness, not a hostile-code jail — and **Docker daemon access is effectively host-root.** `--privileged`, host networking, host bind-mounts, mounting `/var/run/docker.sock`, `--device` passthrough, `--cap-add`, or loose user-namespace settings all make it strictly worse; an unbounded box can also exhaust host CPU/RAM/disk (cap with `--memory`/`--cpus`/`--pids-limit`). Don't run untrusted code and call it safe.
 - **Always tear down** (`docker rm -f "$BOX"`). A lingering "temporary" box is how the disposable estate stops being disposable.
 
 ## Common mistakes
@@ -92,4 +128,4 @@ Distilled 2026-07-08 from a live case (testing a colleague's uv-bootstrap instal
 - **Field caveats the clean control omitted** — arch · musl/glibc · `0.0.0.0`+`-p` reachability · multi-homed QR interface · unique-name teardown · `/dev/tty` piping limit.
 - **One solid routing fact** — native `/sandbox` can't make "no Python" true (runs on host toolchain); the rest of the routing is preference, flagged as such.
 
-One clean-lineage control run so far; the open residual is whether a *leading* "use a node" frame still misdirects a capable agent (the wild failure) — needs 5+ reps to quantify. Refine via `/whiteboxing` (ledger: `POLISH.md`).
+Residual now quantified — 5 cross-lineage reps (Codex) under the *leading* "find/arrange a node without Python" frame: **0/5** took the destructive uninstall-on-shared-host move (several refused it as risky), **3/5** pivoted to a container unaided, **0/5** surfaced any field caveat. So the anti-shenanigan branch is near-empty even under leading framing (guardrail = low-probability insurance, kept on consequences-dominate grounds), and the **field caveats are the one thing every fresh/foreign agent misses** — treat those as the load-bearing content. (Recipe + caveats measured on **arm64 / Apple Silicon**, Docker Desktop; x86 unverified.) Refined via `/whiteboxing`; the polish ledger is kept locally (not in this repo).
