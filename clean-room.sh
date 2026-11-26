@@ -29,10 +29,12 @@ ARCH="$(docker exec "$BOX" uname -m)"
 echo "   box arch: $ARCH   (proving on this arch ONLY — say so; x86 needs --platform linux/amd64 + QEMU)"
 
 say "2. canary: prove python3 is genuinely absent (honest pre-check)"
-if docker exec "$BOX" bash -c 'command -v python3' >/dev/null 2>&1; then
-  echo "   ✗ python3 IS present — this base is not a 'no Python' clean-room"; exit 1
+# Positive sentinel: a failed exec (no bash/sh in the image) must not read as "absent".
+found="$(docker exec "$BOX" sh -c 'command -v python3 || command -v python || echo ABSENT')"
+if [ "$found" != ABSENT ]; then
+  echo "   ✗ Python IS present ($found) — this base is not a 'no Python' clean-room"; exit 1
 fi
-echo "   ✓ python3 not on PATH — the absence is real"
+echo "   ✓ python3/python not on PATH — the absence is real"
 
 say "3. provision only what a realistic fresh box has (curl, ca-certs) — NOT the thing under test"
 docker exec "$BOX" bash -c 'apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null 2>&1'
